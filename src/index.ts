@@ -1,2 +1,4 @@
-export { GoAwayCode } from './frame.js'
-export * from './muxer.js'
+export { GoAwayCode } from './frame'
+export * from './types'
+export * from './logger'
+export * from './muxer'

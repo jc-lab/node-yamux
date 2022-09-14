@@ -1,54 +1,44 @@
-import { Components } from '@libp2p/components'
-import type { Initializable } from '@libp2p/components'
-import type { Stream } from '@libp2p/interface-connection'
-import type { StreamMuxer, StreamMuxerFactory, StreamMuxerInit } from '@libp2p/interface-stream-muxer'
-import { abortableSource } from 'abortable-iterator'
-import { pipe } from 'it-pipe'
-import type { Sink, Source } from 'it-stream-types'
-import { trackedMap } from '@libp2p/tracked-map'
-import { pushable, Pushable } from 'it-pushable'
+import * as streams from 'stream'
+import type { Stream, StreamMuxer, StreamMuxerInit } from './types'
 import errcode from 'err-code'
-import anySignal from 'any-signal'
-import { Flag, FrameHeader, FrameType, GoAwayCode, stringifyHeader } from './frame.js'
-import { StreamState, YamuxStream } from './stream.js'
-import { encodeFrame } from './encode.js'
-import { ERR_BOTH_CLIENTS, ERR_INVALID_FRAME, ERR_MAX_OUTBOUND_STREAMS_EXCEEDED, ERR_MUXER_LOCAL_CLOSED, ERR_MUXER_REMOTE_CLOSED, ERR_NOT_MATCHING_PING, ERR_STREAM_ALREADY_EXISTS, ERR_UNREQUESTED_PING, PROTOCOL_ERRORS } from './constants.js'
-import { Config, defaultConfig, verifyConfig } from './config.js'
-import { Decoder } from './decode.js'
-import type { Logger } from '@libp2p/logger'
-import type { Uint8ArrayList } from 'uint8arraylist'
-
-const YAMUX_PROTOCOL_ID = '/yamux/1.0.0'
+import { Flag, FrameHeader, FrameType, GoAwayCode, stringifyHeader } from './frame'
+import { StreamState, YamuxStream } from './stream'
+import { encodeFrame } from './encode'
+import {
+  ERR_BOTH_CLIENTS,
+  ERR_INVALID_FRAME,
+  ERR_MAX_OUTBOUND_STREAMS_EXCEEDED,
+  ERR_MUXER_LOCAL_CLOSED,
+  ERR_MUXER_REMOTE_CLOSED,
+  ERR_NOT_MATCHING_PING,
+  ERR_STREAM_ALREADY_EXISTS,
+  ERR_UNREQUESTED_PING
+} from './constants'
+import { Config, defaultConfig, verifyConfig } from './config'
+import { Decoder } from './decode'
+import type { Logger } from './logger'
+import type { Uint8ArrayList } from './thirdparty/uint8arraylist'
+import { trackedMap, AbortController } from './utils'
 
 export interface YamuxMuxerInit extends StreamMuxerInit, Partial<Config> {
 }
 
-export class Yamux implements StreamMuxerFactory, Initializable {
-  protocol = YAMUX_PROTOCOL_ID
-  private components = new Components()
+export class Yamux {
   private readonly _init: YamuxMuxerInit
 
   constructor (init: YamuxMuxerInit = {}) {
     this._init = init
   }
 
-  init (components: Components): void {
-    this.components = components
-  }
-
   createStreamMuxer (init?: YamuxMuxerInit): YamuxMuxer {
-    return new YamuxMuxer(this.components, {
+    return new YamuxMuxer({
       ...this._init,
       ...init
     })
   }
 }
 
-export class YamuxMuxer implements StreamMuxer {
-  protocol = YAMUX_PROTOCOL_ID
-  source: Pushable<Uint8Array>
-  sink: Sink<Uint8Array>
-
+export class YamuxMuxer extends streams.Duplex implements StreamMuxer {
   private readonly _init: YamuxMuxerInit
   private readonly config: Config
   private readonly log?: Logger
@@ -82,7 +72,12 @@ export class YamuxMuxer implements StreamMuxer {
   private readonly onIncomingStream?: (stream: Stream) => void
   private readonly onStreamEnd?: (stream: Stream) => void
 
-  constructor (components: Components, init: YamuxMuxerInit) {
+  private readonly decoder = new Decoder()
+
+  constructor (init: YamuxMuxerInit) {
+    super({
+      autoDestroy: true
+    })
     this._init = init
     this.client = init.direction === 'outbound'
     this.config = { ...defaultConfig, ...init }
@@ -94,55 +89,7 @@ export class YamuxMuxer implements StreamMuxer {
     this.onIncomingStream = init.onIncomingStream
     this.onStreamEnd = init.onStreamEnd
 
-    this._streams = trackedMap({ metrics: components.getMetrics(), component: 'yamux', metric: 'streams' })
-
-    this.source = pushable({
-      onEnd: (err?: Error): void => {
-        this.log?.('muxer source ended')
-        this.close(err)
-      }
-    })
-
-    this.sink = async (source: Source<Uint8Array>): Promise<void> => {
-      source = abortableSource(
-        source,
-        this._init.signal !== undefined
-          ? anySignal([this.closeController.signal, this._init.signal])
-          : this.closeController.signal,
-        { returnOnAbort: true }
-      )
-
-      let reason, error
-      try {
-        const decoder = new Decoder(source)
-        await pipe(
-          decoder.emitFrames.bind(decoder),
-          async source => {
-            for await (const { header, readData } of source) {
-              await this.handleFrame(header, readData)
-            }
-          }
-        )
-
-        reason = GoAwayCode.NormalTermination
-      } catch (err: unknown) {
-        // either a protocol or internal error
-        const errCode = (err as {code: string}).code
-        if (PROTOCOL_ERRORS.has(errCode)) {
-          this.log?.error('protocol error in sink', err)
-          reason = GoAwayCode.ProtocolError
-        } else {
-          this.log?.error('internal error in sink', err)
-          reason = GoAwayCode.InternalError
-        }
-
-        error = err as Error
-      }
-
-      this.log?.('muxer sink ended')
-
-      this.close(error, reason)
-    }
+    this._streams = trackedMap({ metrics: init.metrics, component: 'yamux', metric: 'streams' })
 
     this.numInboundStreams = 0
     this.numOutboundStreams = 0
@@ -220,9 +167,9 @@ export class YamuxMuxer implements StreamMuxer {
           const closed = () => {
             reject(errcode(new Error('muxer closed locally'), ERR_MUXER_LOCAL_CLOSED))
           }
-          this.closeController.signal.addEventListener('abort', closed, { once: true })
+          this.closeController.once('abort', closed) // this.closeController.signal.addEventListener('abort', closed, { once: true })
           _resolve = () => {
-            this.closeController.signal.removeEventListener('abort', closed)
+            this.closeController.off('abort', closed) // this.closeController.signal.removeEventListener('abort', closed)
             resolve()
           }
         }),
@@ -297,6 +244,28 @@ export class YamuxMuxer implements StreamMuxer {
     return this.closeController.signal.aborted
   }
 
+  _read (size: number) {}
+
+  _final (callback: (error?: (Error | null)) => void) {
+    this.close(undefined, GoAwayCode.NormalTermination)
+    super._final(callback)
+  }
+
+  _destroy (error: any, callback: (error: (Error | null)) => void) {
+    this.log?.('muxer source ended')
+    this.close(error)
+    callback(null)
+  }
+
+  _write (chunk: any, encoding: BufferEncoding, callback: (error?: (Error | null)) => void) {
+    const messages = this.decoder.emitFrames(chunk)
+    messages.reduce(async (prev, cur) => await prev.then(async () => {
+      return await this.handleFrame(cur.header, cur.data)
+    }), Promise.resolve())
+      .then(() => callback())
+      .catch((err) => callback(err))
+  }
+
   /**
    * Called when either the local or remote shuts down the muxer
    */
@@ -305,7 +274,7 @@ export class YamuxMuxer implements StreamMuxer {
     this.closeController.abort()
 
     // stop the source
-    this.source.end()
+    this.emit('end') // this.source.end()
   }
 
   /** Create a new stream */
@@ -346,7 +315,9 @@ export class YamuxMuxer implements StreamMuxer {
   }
 
   private async keepAliveLoop (): Promise<void> {
-    const abortPromise = new Promise((_resolve, reject) => this.closeController.signal.addEventListener('abort', reject, { once: true }))
+    const abortPromise = new Promise((_resolve, reject) => {
+      this.closeController.once('abort', reject) // this.closeController.signal.addEventListener('abort', reject, { once: true })
+    })
     this.log?.('muxer keepalive enabled interval=%s', this.config.keepAliveInterval)
     while (true) {
       let timeoutId
@@ -366,7 +337,7 @@ export class YamuxMuxer implements StreamMuxer {
     }
   }
 
-  private async handleFrame (header: FrameHeader, readData?: () => Promise<Uint8ArrayList>): Promise<void> {
+  private async handleFrame (header: FrameHeader, data: Uint8ArrayList): Promise<void> {
     const {
       streamID,
       type,
@@ -388,7 +359,7 @@ export class YamuxMuxer implements StreamMuxer {
       switch (header.type) {
         case FrameType.Data:
         case FrameType.WindowUpdate:
-          return await this.handleStreamMessage(header, readData)
+          return await this.handleStreamMessage(header, data)
         default:
           // Invalid state
           throw errcode(new Error('Invalid frame type'), ERR_INVALID_FRAME, { header })
@@ -437,7 +408,7 @@ export class YamuxMuxer implements StreamMuxer {
     this._closeMuxer()
   }
 
-  private async handleStreamMessage (header: FrameHeader, readData?: () => Promise<Uint8ArrayList>): Promise<void> {
+  private async handleStreamMessage (header: FrameHeader, data: Uint8ArrayList): Promise<void> {
     const { streamID, flag, type } = header
 
     if ((flag & Flag.SYN) === Flag.SYN) {
@@ -448,10 +419,9 @@ export class YamuxMuxer implements StreamMuxer {
     if (stream === undefined) {
       if (type === FrameType.Data) {
         this.log?.('discarding data for stream id=%s', streamID)
-        if (readData === undefined) {
+        if (!data) {
           throw new Error('unreachable')
         }
-        await readData()
       } else {
         this.log?.('frame for missing stream id=%s', streamID)
       }
@@ -463,11 +433,11 @@ export class YamuxMuxer implements StreamMuxer {
         return stream.handleWindowUpdate(header)
       }
       case FrameType.Data: {
-        if (readData === undefined) {
+        if (!data) {
           throw new Error('unreachable')
         }
 
-        return await stream.handleData(header, readData)
+        return await stream.handleData(header, data)
       }
       default:
         throw new Error('unreachable')
@@ -517,7 +487,7 @@ export class YamuxMuxer implements StreamMuxer {
 
   private sendFrame (header: FrameHeader, data?: Uint8Array): void {
     this.log?.trace('sending frame %s', stringifyHeader(header))
-    this.source.push(encodeFrame(header, data))
+    this.push(encodeFrame(header, data))
   }
 
   private sendPing (pingId: number, flag: Flag = Flag.SYN): void {
@@ -528,7 +498,7 @@ export class YamuxMuxer implements StreamMuxer {
     }
     this.sendFrame({
       type: FrameType.Ping,
-      flag: flag,
+      flag,
       streamID: 0,
       length: pingId
     })

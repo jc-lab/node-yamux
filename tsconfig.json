@@ -1,10 +1,16 @@
 {
-  "extends": "aegir/src/config/tsconfig.aegir.json",
+  "extends": "./tsconfig.dist.json",
   "compilerOptions": {
-    "outDir": "dist"
+    "outDir": ".build/test/tsc"
   },
   "include": [
     "src",
+    "examples",
     "test"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    ".build"
   ]
 }

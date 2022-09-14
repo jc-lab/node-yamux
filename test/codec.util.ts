@@ -1,6 +1,6 @@
 import errcode from 'err-code'
-import { ERR_DECODE_INVALID_VERSION, ERR_INVALID_FRAME } from '../src/constants.js'
-import { FrameHeader, FrameType, HEADER_LENGTH, YAMUX_VERSION } from '../src/frame.js'
+import { ERR_DECODE_INVALID_VERSION, ERR_INVALID_FRAME } from '../src/constants'
+import { FrameHeader, FrameType, HEADER_LENGTH, YAMUX_VERSION } from '../src/frame'
 
 // Slower encode / decode functions that use dataview
 

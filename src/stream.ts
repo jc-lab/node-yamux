@@ -1,13 +1,12 @@
-import type { Stream, StreamStat } from '@libp2p/interface-connection'
-import { pushable, Pushable } from 'it-pushable'
-import type { Sink, Source } from 'it-stream-types'
+import * as streams from 'stream'
+import type { Stream } from './types'
 import errcode from 'err-code'
-import { abortableSource } from 'abortable-iterator'
-import type { Uint8ArrayList } from 'uint8arraylist'
-import { Flag, FrameHeader, FrameType, HEADER_LENGTH } from './frame.js'
-import { ERR_RECV_WINDOW_EXCEEDED, ERR_STREAM_ABORT, ERR_STREAM_RESET, INITIAL_STREAM_WINDOW } from './constants.js'
-import type { Logger } from '@libp2p/logger'
-import type { Config } from './config.js'
+import type { Uint8ArrayList } from './thirdparty/uint8arraylist'
+import { Flag, FrameHeader, FrameType, HEADER_LENGTH } from './frame'
+import { ERR_RECV_WINDOW_EXCEEDED, ERR_STREAM_ABORT, ERR_STREAM_RESET, INITIAL_STREAM_WINDOW } from './constants'
+import type { Logger } from './logger'
+import type { Config } from './config'
+import { AbortController } from './utils'
 
 export enum StreamState {
   Init,
@@ -36,10 +35,10 @@ export interface YamuxStreamInit {
 }
 
 /** YamuxStream is used to represent a logical stream within a session */
-export class YamuxStream implements Stream {
+export class YamuxStream extends streams.Duplex implements Stream {
   id: string
   name?: string
-  stat: StreamStat
+  // stat: StreamStat
   metadata: Record<string, any>
 
   state: StreamState
@@ -47,13 +46,6 @@ export class YamuxStream implements Stream {
   readState: HalfStreamState
   /** Used to track sent FIN/RST */
   writeState: HalfStreamState
-
-  /** Input to the read side of the stream */
-  sourceInput: Pushable<Uint8ArrayList>;
-  /** Read side of the stream */
-  source: Source<Uint8ArrayList>;
-  /** Write side of the stream */
-  sink: Sink<Uint8Array | Uint8ArrayList>;
 
   private readonly config: Config
   private readonly log?: Logger
@@ -84,17 +76,21 @@ export class YamuxStream implements Stream {
   private readonly onStreamEnd: () => void
 
   constructor (init: YamuxStreamInit) {
+    super({
+      autoDestroy: true
+    })
+
     this.config = init.config
     this.log = init.log
     this._id = init.id
     this.id = String(init.id)
     this.name = init.name
-    this.stat = {
-      direction: init.direction,
-      timeline: {
-        open: Date.now()
-      }
-    }
+    // this.stat = {
+    //   direction: init.direction,
+    //   timeline: {
+    //     open: Date.now()
+    //   }
+    // }
     this.metadata = {}
 
     this.state = init.state
@@ -111,57 +107,6 @@ export class YamuxStream implements Stream {
 
     this.sendFrame = init.sendFrame
     this.onStreamEnd = init.onStreamEnd
-
-    this.sourceInput = pushable({
-      onEnd: (err?: Error) => {
-        this.log?.('stream source ended id=%s', this._id, err)
-        this.closeRead()
-      }
-    })
-
-    this.source = this.createSource()
-
-    this.sink = async (source: Source<Uint8Array | Uint8ArrayList>): Promise<void> => {
-      if (this.writeState !== HalfStreamState.Open) {
-        throw new Error('stream closed for writing')
-      }
-
-      source = abortableSource(source, this.abortController.signal, { returnOnAbort: true })
-
-      try {
-        for await (let data of source) {
-          // send in chunks, waiting for window updates
-          while (data.length !== 0) {
-            // wait for the send window to refill
-            if (this.sendWindowCapacity === 0) await this.waitForSendWindowCapacity()
-
-            // send as much as we can
-            const toSend = Math.min(this.sendWindowCapacity, this.config.maxMessageSize - HEADER_LENGTH, data.length)
-            this.sendData(data.subarray(0, toSend))
-            this.sendWindowCapacity -= toSend
-            data = data.subarray(toSend)
-          }
-        }
-      } finally {
-        this.log?.('stream sink ended id=%s', this._id)
-        this.closeWrite()
-      }
-    }
-  }
-
-  private async * createSource () {
-    try {
-      for await (const val of this.sourceInput) {
-        this.sendWindowUpdate()
-        yield val
-      }
-    } catch (err) {
-      const errCode = (err as {code: string}).code
-      if (errCode !== ERR_STREAM_ABORT && errCode !== ERR_STREAM_RESET) {
-        this.log?.error('stream source error id=%s', this._id, err)
-        throw err
-      }
-    }
   }
 
   close (): void {
@@ -184,7 +129,7 @@ export class YamuxStream implements Stream {
     this.readState = HalfStreamState.Closed
 
     // close the source
-    this.sourceInput.end()
+    this.emit('end') // this.sourceInput.end()
 
     // If the both read and write are closed, finish it
     if (this.writeState !== HalfStreamState.Open) {
@@ -248,6 +193,37 @@ export class YamuxStream implements Stream {
     this.onReset(errcode(new Error('stream reset'), ERR_STREAM_RESET))
   }
 
+  _read (size: number) {}
+
+  _write (chunk: any, encoding: BufferEncoding, callback: (error?: (Error | null)) => void) {
+    if (this.writeState !== HalfStreamState.Open) {
+      throw new Error('stream closed for writing ')
+    }
+
+    (async () => {
+      let data = chunk as Buffer
+      // send in chunks, waiting for window updates
+      while (data.length !== 0) {
+        // wait for the send window to refill
+        if (this.sendWindowCapacity === 0) await this.waitForSendWindowCapacity()
+
+        // send as much as we can
+        const toSend = Math.min(this.sendWindowCapacity, this.config.maxMessageSize - HEADER_LENGTH, data.length)
+        this.sendData(data.subarray(0, toSend))
+        this.sendWindowCapacity -= toSend
+        data = data.subarray(toSend)
+      }
+    })()
+      .then(() => callback())
+      .catch((err) => callback(err))
+  }
+
+  _final (callback: (error?: (Error | null)) => void) {
+    this.log?.('stream sink ended id=%s', this._id)
+    this.closeWrite()
+    callback()
+  }
+
   /**
    * Called when initiating and receiving a stream reset
    */
@@ -262,7 +238,8 @@ export class YamuxStream implements Stream {
     this.state = StreamState.Finished
 
     // close both the source and sink
-    this.sourceInput.end(err)
+    this.emit('end') // this.sourceInput.end(err)
+    void err
     this.abortController.abort()
 
     // and finish the stream
@@ -285,10 +262,10 @@ export class YamuxStream implements Stream {
     const abort = () => {
       reject(errcode(new Error('stream aborted'), ERR_STREAM_ABORT))
     }
-    this.abortController.signal.addEventListener('abort', abort)
+    this.abortController.on('abort', abort) // this.abortController.signal.addEventListener('abort', abort)
     return await new Promise((_resolve, _reject) => {
       this.sendWindowCapacityUpdate = () => {
-        this.abortController.signal.removeEventListener('abort', abort)
+        this.abortController.off('abort', abort) // this.abortController.signal.removeEventListener('abort', abort)
         _resolve(undefined)
       }
       reject = _reject
@@ -314,7 +291,7 @@ export class YamuxStream implements Stream {
   /**
    * handleData is called when the stream receives a data frame
    */
-  async handleData (header: FrameHeader, readData: () => Promise<Uint8ArrayList>): Promise<void> {
+  async handleData (header: FrameHeader, data: Uint8ArrayList): Promise<void> {
     this.log?.('stream received data id=%s', this._id)
     this.processFlags(header.flag)
 
@@ -323,9 +300,12 @@ export class YamuxStream implements Stream {
       throw errcode(new Error('receive window exceeded'), ERR_RECV_WINDOW_EXCEEDED, { available: this.recvWindowCapacity, recv: header.length })
     }
 
-    const data = await readData()
     this.recvWindowCapacity -= header.length
-    this.sourceInput.push(data)
+    for (const chunk of data) {
+      this.push(chunk)
+      this.sendWindowUpdate()
+    }
+    // this.sourceInput.push(data)
   }
 
   /**
@@ -351,8 +331,9 @@ export class YamuxStream implements Stream {
   private finish (): void {
     this.log?.('stream finished id=%s', this._id)
     this.state = StreamState.Finished
-    this.stat.timeline.close = Date.now()
+    // this.stat.timeline.close = Date.now()
     this.onStreamEnd()
+    this.destroy()
   }
 
   /**

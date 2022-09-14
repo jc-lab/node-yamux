@@ -1,12 +1,16 @@
-import { Uint8ArrayList } from 'uint8arraylist'
+import { Uint8ArrayList } from './thirdparty/uint8arraylist'
 import errcode from 'err-code'
-import { FrameHeader, FrameType, HEADER_LENGTH, YAMUX_VERSION } from './frame.js'
-import { ERR_DECODE_INVALID_VERSION, ERR_DECODE_IN_PROGRESS } from './constants.js'
-import type { Source } from 'it-stream-types'
+import { FrameHeader, HEADER_LENGTH, YAMUX_VERSION } from './frame'
+import { ERR_DECODE_INVALID_VERSION, ERR_DECODE_IN_PROGRESS } from './constants'
 
 // used to bitshift in decoding
 // native bitshift can overflow into a negative number, so we bitshift by multiplying by a power of 2
 const twoPow24 = 2 ** 24
+
+export interface DecodedMessage {
+  header: FrameHeader
+  data: Uint8ArrayList
+}
 
 /**
  * Decode a header from the front of a buffer
@@ -29,13 +33,14 @@ export function decodeHeader (data: Uint8Array): FrameHeader {
  * Decodes yamux frames from a source
  */
 export class Decoder {
-  private readonly source: Source<Uint8Array>
   /** Buffer for in-progress frames */
   private readonly buffer: Uint8ArrayList
   /** Used to sanity check against decoding while in an inconsistent state */
-  private frameInProgress: boolean
+  private readonly frameInProgress: boolean
 
-  constructor (source: Source<Uint8Array>) {
+  private _headerInfo: FrameHeader | undefined = undefined
+
+  constructor () {
     // Normally, when entering a for-await loop with an iterable/async iterable, the only ways to exit the loop are:
     // 1. exhaust the iterable
     // 2. throw an error - slow, undesireable if there's not actually an error
@@ -44,7 +49,6 @@ export class Decoder {
     // In this case, we want to enter (and exit) a for-await loop per chunked data frame and continue processing the iterable.
     // To do this, we strip the `return` method from the iterator and can now `break` early and continue iterating.
     // Exiting the main for-await is still possible via 1. and 2.
-    this.source = returnlessSource(source)
     this.buffer = new Uint8ArrayList()
     this.frameInProgress = false
   }
@@ -55,32 +59,35 @@ export class Decoder {
    * Note: If `readData` is emitted, it _must_ be called before the next iteration
    * Otherwise an error is thrown
    */
-  async * emitFrames (): AsyncGenerator<{header: FrameHeader, readData?: () => Promise<Uint8ArrayList>}> {
-    for await (const chunk of this.source) {
-      this.buffer.append(chunk)
-
-      // Loop to consume as many bytes from the buffer as possible
-      // Eg: when a single chunk contains several frames
-      while (true) {
-        const header = this.readHeader()
-        if (header === undefined) {
-          break
-        }
-
-        const { type, length } = header
-        if (type === FrameType.Data) {
-          // This is a data frame, the frame body must still be read
-          // `readData` must be called before the next iteration here
-          this.frameInProgress = true
-          yield {
-            header,
-            readData: this.readBytes.bind(this, length)
-          }
-        } else {
-          yield { header }
-        }
-      }
+  emitFrames (chunk: Uint8Array): DecodedMessage[] {
+    if (!chunk || chunk.length === 0) {
+      return []
     }
+
+    this.buffer.append(chunk)
+    const msgs: DecodedMessage[] = []
+
+    while (true) {
+      if (!this._headerInfo) {
+        this._headerInfo = this.readHeader()
+      }
+      if (!this._headerInfo) {
+        break
+      }
+
+      const header = this._headerInfo
+      if (this.buffer.length < header.length) {
+        break
+      }
+
+      const data = this.buffer.sublist(0, header.length)
+      this.buffer.consume(header.length)
+
+      msgs.push({ header, data })
+      this._headerInfo = undefined
+    }
+
+    return msgs
   }
 
   private readHeader (): FrameHeader | undefined {
@@ -98,47 +105,5 @@ export class Decoder {
     const header = decodeHeader(this.buffer.slice(0, HEADER_LENGTH))
     this.buffer.consume(HEADER_LENGTH)
     return header
-  }
-
-  private async readBytes (length: number): Promise<Uint8ArrayList> {
-    if (this.buffer.length < length) {
-      for await (const chunk of this.source) {
-        this.buffer.append(chunk)
-
-        if (this.buffer.length >= length) {
-          // see note above, the iterator is not `return`ed here
-          break
-        }
-      }
-    }
-
-    const out = this.buffer.sublist(0, length)
-    this.buffer.consume(length)
-
-    // The next frame can now be decoded
-    this.frameInProgress = false
-
-    return out
-  }
-}
-
-/**
- * Strip the `return` method from a `Source`
- */
-export function returnlessSource<T> (source: Source<T>): Source<T> {
-  if ((source as Iterable<T>)[Symbol.iterator] !== undefined) {
-    const iterator = (source as Iterable<T>)[Symbol.iterator]()
-    iterator.return = undefined
-    return {
-      [Symbol.iterator] () { return iterator }
-    }
-  } else if ((source as AsyncIterable<T>)[Symbol.asyncIterator] !== undefined) {
-    const iterator = (source as AsyncIterable<T>)[Symbol.asyncIterator]()
-    iterator.return = undefined
-    return {
-      [Symbol.asyncIterator] () { return iterator }
-    }
-  } else {
-    throw new Error('a source must be either an iterable or an async iterable')
   }
 }

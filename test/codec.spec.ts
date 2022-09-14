@@ -1,9 +1,9 @@
-import { expect } from 'aegir/chai'
+import { expect } from 'chai'
 
-import { decodeHeader } from '../src/decode.js'
-import { encodeFrame } from '../src/encode.js'
-import { Flag, FrameHeader, FrameType, GoAwayCode, stringifyHeader } from '../src/frame.js'
-import { decodeHeaderNaive, encodeFrameNaive } from './codec.util.js'
+import { decodeHeader } from '../src/decode'
+import { encodeFrame } from '../src/encode'
+import { Flag, FrameHeader, FrameType, GoAwayCode, stringifyHeader } from '../src/frame'
+import { decodeHeaderNaive, encodeFrameNaive } from './codec.util'
 
 const frames: Array<{header: FrameHeader, data?: Uint8Array}> = [
   { header: { type: FrameType.Ping, flag: Flag.SYN, streamID: 0, length: 1 } },

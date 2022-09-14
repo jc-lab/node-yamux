@@ -1,7 +1,7 @@
 import errcode from 'err-code'
-import type { Uint8ArrayList } from 'uint8arraylist'
-import { FrameHeader, FrameType, HEADER_LENGTH } from './frame.js'
-import { ERR_INVALID_FRAME } from './constants.js'
+import type { Uint8ArrayList } from './thirdparty/uint8arraylist'
+import { FrameHeader, FrameType, HEADER_LENGTH } from './frame'
+import { ERR_INVALID_FRAME } from './constants'
 
 export function encodeFrame (header: FrameHeader, data?: Uint8Array | Uint8ArrayList): Uint8Array {
   let frame

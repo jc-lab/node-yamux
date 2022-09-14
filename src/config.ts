@@ -1,9 +1,11 @@
-import { logger, Logger } from '@libp2p/logger'
+import { dummyLogger, Logger, LoggerFactory } from './logger'
 import errcode from 'err-code'
-import { ERR_INVALID_CONFIG, INITIAL_STREAM_WINDOW, MAX_STREAM_WINDOW } from './constants.js'
+import { ERR_INVALID_CONFIG, INITIAL_STREAM_WINDOW, MAX_STREAM_WINDOW } from './constants'
 
 // TOOD use config items or delete them
 export interface Config {
+  loggerFactory?: LoggerFactory
+
   /**
    * Used to control the log destination
    *
@@ -55,7 +57,7 @@ export interface Config {
 }
 
 export const defaultConfig: Config = {
-  log: logger('libp2p:yamux'),
+  log: dummyLogger(),
   enableKeepAlive: true,
   keepAliveInterval: 30_000,
   maxInboundStreams: 1_000,
