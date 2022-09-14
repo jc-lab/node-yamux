@@ -1,6 +1,6 @@
 import { Uint8ArrayList } from './thirdparty/uint8arraylist'
 import errcode from 'err-code'
-import { FrameHeader, HEADER_LENGTH, YAMUX_VERSION } from './frame'
+import { FrameHeader, FrameType, HEADER_LENGTH, YAMUX_VERSION } from './frame'
 import { ERR_DECODE_INVALID_VERSION, ERR_DECODE_IN_PROGRESS } from './constants'
 
 // used to bitshift in decoding
@@ -76,14 +76,20 @@ export class Decoder {
       }
 
       const header = this._headerInfo
-      if (this.buffer.length < header.length) {
-        break
+
+      if (header.type === FrameType.Data) {
+        if (this.buffer.length < header.length) {
+          break
+        }
+
+        const data = this.buffer.sublist(0, header.length)
+        this.buffer.consume(header.length)
+
+        msgs.push({ header, data })
+      } else {
+        msgs.push({ header, data: null as any })
       }
 
-      const data = this.buffer.sublist(0, header.length)
-      this.buffer.consume(header.length)
-
-      msgs.push({ header, data })
       this._headerInfo = undefined
     }
 
